@@ -1,0 +1,34 @@
+@startuml
+left to right direction
+
+package kubevirt {
+  artifact "kubevirt-virt-api.rpm" as api_rpm
+  artifact "kubevirt-virt-controller.rpm" as controller_rpm
+  artifact "kubevirt-virt-handler.rpm" as handler_rpm
+  artifact "kubevirt-virt-launcher.rpm" as launcher_rpm
+  artifact "kubevirt-virt-operator.rpm" as operator_rpm
+  artifact "..." as others_rpm
+}
+
+package "virt-api-container" {
+  file Dockerfile as api_dockerfile
+}
+package "virt-controller-container" {
+  file Dockerfile as controller_dockerfile
+}
+package "virt-handler-container" {
+  file Dockerfile as handler_dockerfile
+}
+package "virt-launcher-container" {
+  file Dockerfile as launcher_dockerfile
+}
+package "virt-operator-container" {
+  file Dockerfile as operator_dockerfile
+}
+
+api_dockerfile -u-> api_rpm
+controller_dockerfile -u--> controller_rpm
+handler_dockerfile -u-> handler_rpm
+launcher_dockerfile -u--> launcher_rpm
+operator_dockerfile -u-> operator_rpm
+@enduml

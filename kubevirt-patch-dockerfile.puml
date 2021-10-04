@@ -1,0 +1,22 @@
+@startuml
+left to right direction
+
+package kubevirt {
+  artifact "kubevirt-manifests.rpm" as manifests_rpm
+  artifact "obs-service-kubevirt_containers_meta.rpm" as meta_rpm
+}
+
+package "obs-service-replace_using_env" {
+  artifact "obs-service-replace_using_env.rpm" as env_replace_rpm
+}
+
+package "virt-*-container" {
+  file Dockerfile as dockerfile
+  file _service as service
+}
+
+service -u-> meta_rpm
+service -u-> env_replace_rpm
+env_replace_rpm -u-> dockerfile : patch
+env_replace_rpm -d.> meta_rpm : source
+@enduml

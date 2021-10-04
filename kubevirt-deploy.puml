@@ -1,0 +1,40 @@
+@startuml
+left to right direction
+
+package kubevirt-manifests {
+  file "kubevirt-operator.yaml" as op
+  file "kubevirt-cr.yaml" as cr
+}
+
+note as n1
+  kubectl apply -f kubevirt-operator.yaml
+  kubectl apply -f kubevirt-cr.yaml
+end note
+
+actor user
+
+note as n
+  registry/virt-operator:<tag>
+end note
+
+cloud registry
+
+node master
+node worker1
+node worker2
+
+op .. n
+n .. registry
+
+user --> n1
+n1 . op
+n1 . cr
+
+n1 --> master
+master .> worker1
+master .> worker2
+
+master <-- registry : pull
+worker1 <-- registry : pull
+worker2 <-- registry : pull
+@enduml
