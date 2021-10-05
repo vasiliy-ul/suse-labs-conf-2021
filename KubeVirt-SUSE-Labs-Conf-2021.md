@@ -152,8 +152,79 @@ Areas of contribution:
 
 ## Research: the cost of containerizing VMs
 
-<TBD>
+Something that we decided to investigate is what are the differences when it comes to tuning virtualization workloads when using the traditional KVM stack and KubeVirt.
+This was a joint project with the NARA Institute of Science and Technology ([NAIST][7]) in Japan and some preliminary results have been presented to [KVM Forum 2021][8].
 
+### The experimental setup
+
+We used a 32 physical CPUs server both as the KVM host and as the KubeVirt worker node, i.e., where the VMs were actually running, in both cases.
+It had two NUMA nodes with 8 cores each and hyperthreading enabled.
+In some more details:
+- Intel(R) Xeon(R) Silver 4208 CPU @ 2.10GHz
+  - CPU(s): 32
+  - NUMA nodes (== sockets): 2
+  - Threads per core: 2
+  - Cores per socket: 8
+- Family / Model / Stepping: 6 / 85 / 7
+- MHz (min/max): 800 / 3200
+- Cache:
+  - L1 (i & d): 512 KB
+  - L2: 16 MiB
+  - L3: 22 MiB
+- RAM: 32 GiB (16 GiB on each node)
+- Disk:	rotational device (no SSD)
+
+![Server](images/servertopo.png)
+
+From a software point of view, the host was Ubuntu 20.04.2 LTS, with kernel 5.4.0.
+We used the latest available KubeVirt release which, when we run the experiments, was 0.44.0 and included QEMU 5.2.0 and libvirt 7.0.0.
+Kubernetes version was 1.21 and the container runtime was [docker][9].
+For the KVM experiments, we built from sources and used the very same versions of those components.
+
+We run our experiments inside a 1 vCPU VM, and then we repeated them inside a 4 vCPUs VM.
+The VM had 8 Gigabytes of RAM (in both cases) and was running openSUSE Leap 15.2. We used [MMTests][10] as our benchmarking suite, as it can orchestrate running benchmarks inside (one or even multiple) VM(s).
+
+We have run several benchmarks:
+- [cyclictest][11]
+  - thread wakeup time was 1 ms, they had FIFO priority, and hackbench was running in background
+  - 2 configurations:
+    - threads pinned to vCPUs
+    - threads not pinned (unbound)
+- [NASA Parallel Benchmark][12]
+  - 2 threads (which is the half the number of vCPUs of our VM) in parallel, via [OpenMP][13]
+  - various computational kernels:
+    - bt, cg, ep, ft, is, sp, ua
+- [STREAM][14]
+  - 2 threads (which is the half the number of vCPUs of our VM) in parallel, via [OpenMP][13]
+  - multiple memory operations:
+    - copy, scale, add, triadd
+- [hackbench][15]
+  - with multiple processes, communicating via pipes (implemented by `perf bench sched pipe`)
+  - 2 configurations:
+    - processes groups (80 tasks), 4 thread groups (160 tasks)
+- [kernbench][16]
+  - with `vmlinux` as build target (with `defconfig`)
+  - 4 configurations:
+    - `make -j 1`, `make -j 2` and `make -j 4`
+- [iozone][17]
+  - for synchronous IO
+  - multiple operations:
+    - write, rewrite, read, reread, random red, random write, backward read
+  - multiple configurations (with different file sizes):
+    - 1GB, 2GB, 4GB
+
+All benchmarks were, of course, running inside the VMs.
+We have also considered different load conditions for the host.
+In fact, We run all the benchmarks on an host which was only running our VM, and was otherwise idle.
+Then we run them while imposing, at the same time, an extraneous 50% load on the host and also with 100% extraneous load.
+For generating load on the host we used various [stress-ng][18] threads in a way that they can simulate having had other VMs running at the same time of our one.
+Basically, in what we call the _idle host_ case, only the VM was running.
+In the _host loaded_ case, `stress-ng` was used to generate a 1400% (out of a total of 3200%) artificial load on the host.
+This can be considered representative of a situation where the host would be running 7 additional (to our one) VMs with 4 vCPUs, each one of which is 50% loaded.
+Finally, in the _highly loaded_ case, `stress-ng` was generating approximately 2800% artificial load, which could be considered similar to having 7 additional VMs with 4 vCPUs, each of which is 100% loaded.
+Considering that also our VM had (at most) 4 vCPUs, the highly loaded case was indicative of a fully loaded, but not oversubscribed, situation.
+
+This paper includes a subset of all the results that we collected.
 
 ## References
 
@@ -163,3 +234,15 @@ Areas of contribution:
 [4]: https://github.com/kubevirt/containerized-data-importer
 [5]: https://kubernetes.io/docs/concepts/storage/persistent-volumes/
 [6]: https://github.com/harvester/harvester
+[7]: http://www.naist.jp/en/
+[8]: https://www.youtube.com/watch?v=x_czS9Iuo2o
+[9]: https://www.docker.com/
+[10]: https://github.com/gormanm/mmtests
+[11]: https://wiki.linuxfoundation.org/realtime/documentation/howto/tools/cyclictest/start
+[12]: https://www.nas.nasa.gov/software/npb.html
+[13]: https://www.openmp.org/
+[14]: https://www.cs.virginia.edu/stream/
+[15]: https://man7.org/linux/man-pages/man1/perf-bench.1.html
+[16]: http://ck.kolivas.org/apps/kernbench/kernbench-0.50/
+[17]: https://www.iozone.org/
+[18]: sttress-ng
