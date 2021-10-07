@@ -155,6 +155,169 @@ Areas of contribution:
 Something that we decided to investigate is what are the differences when it comes to tuning virtualization workloads when using the traditional KVM stack and KubeVirt.
 This was a joint project with the NARA Institute of Science and Technology ([NAIST][7]) in Japan and some preliminary results have been presented to [KVM Forum 2021][8].
 
+### Tuning virtualized workloads
+
+One popular and effective way of tuning virtualization workloads is statically or semi-statically partition the resources of the host among the various VMs.
+This means doing virtual CPUs (vCPUs) and memory pinning and often also defining a virtual topology for the VMs themselves.
+Performance also improve using huge pages and isolating the VMs vCPUs from the interference of any IO activity.
+
+#### vCPU pinning and virtual topology
+
+If our VM has more than one vCPU, it can have a virtual topology, which means that its vCPUs can be arranged in **virtual cores**, **virtual threads**, **virtual sockets** and **virtual NUMA nodes**.
+
+![Topology](images/topology.png)
+
+The software running inside of the VM, both the kernel and the user-space programs, will then see such a topology and will make assumptions and enact optimizations that will often lead to better performance.
+
+The following figure shows some examples of virtual topologies:
+
+![VM-Topology](images/virt-topo.png)
+
+vCPUs can be _pinned_ to the host physical CPUs (pCPUs).
+This means that the host scheduler will run the vCPUs only on a specific, and explicitly defined, subset of the host pCPUs (possibly, even only on one).
+Using pinning can be very effective for cutting down the overhead of migrating vCPUs among pCPUs, and even more important for partitioning the host resources among the various VMs and.
+
+The two techniques can combine, usually achieving significant cumulative performance improvements, if we pin the vCPUs in such a way that the virtual topology that has been defined for the VM matches the physical topology of the group of pCPUs where the vCPUs of the VM run.
+We can also completely disrupt the performance, if we wrongly map the guest virtual topology on the host physical topology, for instance by pinning vCPUs of a virtual core on pCPUs from different physical cores.
+And even worse if we also get the resource partitioning part wrong.
+Some more considerations on this subject can be found in this [KVM Forum 2020 talk][19].
+
+![Topology-and-pinning](images/topo-and-pin.png)
+
+#### Tuning memory and IO
+
+In addition to all that was mentioned in the previous section, if we are pinning the vCPUs on the pCPUs of a specific NUMA node, it makes sense to also make sure that the memory of the VM is entirely allocated on that NUMA node, to avoid the latency of  remote memory accesses.
+And there are also other things that we can do like using `host-passthrough` as the CPU model, which we did in our experiments.
+Furthermore, we can enable something called `KVM_HINT_DEDICATED` and the `cpuidle-haltpoll` governor inside the guest.
+These two features, however, are not covered in this paper (and were not used for the experiments).
+More information about them can be found in [this SUSE Labs Conference 2020 talk][20].
+
+Furthermore, using huge (also called large) pages means using memory pages bigger than the default 4 Kilobytes for backing the memory of the VM.
+This improves performance because walking the various levels of page tables for translating the VM virtual addresses into host physical addresses happens less often, lowering the pressure on the TLB, and when it happens, it is also faster.
+And it is also possible to cut out of QEMU the threads that deal with IO events, in the attempt to improve the scalability of IO itself, and isolate the vCPUs from its interference.
+We are still in the process of running experiments with this setup.
+
+Still about IO, for our configuration, which uses a pre-allocated raw disk image, using the so-called _native IO model_ is really important.
+The IOzone benchmark, for instance, was not even able to finish unless we used `io=native`.
+We are, therefore, doing that for all the benchmarks, on all the cases and scenarios.
+Apart from that, IO tuning at the virtual device level happens by specifying a caching mode and whether or not we have and want to use multi-queueing.
+
+### Tuning on KVM
+
+For KVM, 4 different configurations are considered.
+The default one (_def_), with no pinning at all for the vCPUs and no virtual topology for the VM.
+Then pinning-default and pinning (_pin\_def_ and _pin_, respectively) ones, with 1-to-1 vCPU pinning and either just using the default virtual topology (pin\_def), or defining a custom one with all vCPUs as cores of the same socket (pin).
+Finally, the fully tuned (_vtune_) one, whith 1-to-1 vCPU pinning and perfect guest to host virtual topology mapping.
+
+The following code snippets show the relevant part of a VM config file that enacts each configuration:
+
+```xml
+<!-- def -->
+<vcpu placement='static'>4</vcpu>
+<cpu mode='host-model' check='partial'/>
+```
+```xml
+<!-- pin_def -->
+<vcpu placement='static'>4</vcpu>
+<cputune>
+  <vcpupin vcpu='0' cpuset='1'/>
+  <vcpupin vcpu='1' cpuset='17'/>
+  <vcpupin vcpu='2' cpuset='2'/>
+  <vcpupin vcpu='3' cpuset='18'/>
+</cputune>
+<cpu mode='host-passthrough' check='none'>
+```
+```xml
+<!-- pin -->
+<vcpu placement='static'>4</vcpu>
+<cputune>
+  <vcpupin vcpu='0' cpuset='1'/>
+  <vcpupin vcpu='1' cpuset='17'/>
+  <vcpupin vcpu='2' cpuset='2'/>
+  <vcpupin vcpu='3' cpuset='18'/>
+</cputune>
+<cpu mode='host-passthrough' check='none'>
+    <topology sockets='1' dies='1' cores='4' threads='1'/>
+</cpu>
+```
+```xml
+<!-- vtune -->
+<vcpu placement='static'>4</vcpu>
+<cputune>
+  <vcpupin vcpu='0' cpuset='1'/>
+  <vcpupin vcpu='1' cpuset='17'/>
+  <vcpupin vcpu='2' cpuset='2'/>
+  <vcpupin vcpu='3' cpuset='18'/>
+</cputune>
+<cpu mode='host-passthrough' check='none'>
+    <topology sockets='1' dies='1' cores='2' threads='2'/>
+</cpu>
+```
+
+The following figure shows a graphical representation of each configuration:
+
+![pin-kvm](images/kvm-pinning.png)
+
+Of course, we expect that it is the last one (vtune) that gives the best results.
+
+### Tuning on KubeVirt
+
+For KubeVirt, we tried to construct the exact same configurations that we built for KVM.
+
+The following code snippets show the relevant part of a VMI definition that enacts each configuration:
+
+```yaml
+# def
+spec:
+  domain:
+    resources:
+      requests:
+        cpu: 4
+```
+```yaml
+# pin_def
+spec:
+  domain:
+    resources:
+      requests:
+        cpu: 4
+    cpu:
+      model: host-passthrough
+      dedicatedCpuPlacement: true
+```
+```yaml
+# pin
+spec:
+  domain:
+    cpu:
+      sockets: 1
+      cores: 4
+      threads: 1
+      model: host-passthrough
+      dedicatedCpuPlacement: true
+```
+```yaml
+# vtune
+spec:
+  domain:
+    cpu:
+      sockets: 1
+      cores: 2
+      threads: 2
+      model: host-passthrough
+      dedicatedCpuPlacement: true
+```
+
+The following figure shows a graphical representation of each configuration:
+
+![pin-kvm](images/kubev-pinning.png)
+
+However, in this case, it is Kubernetes' [CPU Manager][21], as well as KubeVirt itself, that are in control of the VM final setup.
+And this includes where the vCPUs are pinned and how the virtual topology is defined in details.
+As we can see in the figure, what actually happens is that while the pinning is correctly established, the mapping between virtual threads to physical threads is actually wrong, at least for the KubeVirt version we analyzed in this paper.
+
+The experimental evaluation section, will show that this substantially impacts the performance, making what we expected to be the best configuration, one of the worse ones!
+
 ### The experimental setup
 
 We used a 32 physical CPUs server both as the KVM host and as the KubeVirt worker node, i.e., where the VMs were actually running, in both cases.
@@ -226,6 +389,101 @@ Considering that also our VM had (at most) 4 vCPUs, the highly loaded case was i
 
 This paper includes a subset of all the results that we collected.
 
+Note that version 0.45 of KubeVirt [incorporates changes][22] to how vCPU pinning and virtual topology are handled that should mitigate some of the issues that our investigation highlighted (see the following sections). We are planning to repeat our experiments with such (or later) version in order to verify if that is the case, and if yes, up to what extent.
+
+## Experimental results
+
+### STREAM
+
+The figure shows the results of STREAM, running within 2 tasks in parallel, inside a 4 vCPUs VM, for KVM and KubeVirt, under different host load scenarios.
+Note that running with only 2 STREAM tasks in parallel does not saturate the memory bandwidth of our platform.
+This means that we should not expect big improvements, as compared to the default configuration, when applying the tuning.
+Tuning, however, should definitely not lower the performance.
+
+![STREAM](images/stream.png)
+
+It is easy to see how, for KVM, the vtune configuration is always the best one, under any host load scenario.
+On the other hand, doing vCPU pinning and not defining a virtual topology for the guest that matches the one of the pCPUs of the host on which the vCPUs are pinned (i.e., the pin\_def and pin cases), always means worse performance as compared to not doing any pinning and virtual topology at all.
+
+We think that this is due to the fact that with the default virtual topology, since all the vCPUs are treated like they were each one a single and separate socket, the benchmark tasks are only sporadically migrated from a vCPU to another one by the guest scheduler.
+At the same time, since there is no vCPU pinning, the host scheduler is free to move the vCPUs around among the pCPUs and enact, even under high load, very good working conditions.
+On the other hand, when we do vCPU pinning, we make it impossible for the host scheduler to do the same.
+This means that things are entirely in the hands of the guest scheduler and hence how the virtual topology inside of the VM is defined and whether or not it matches the physical topology becomes important.
+This therefore explains why the vtune cases, which can take advantage of both pinning and a properly defined virtual topology, manages to reach the same performance as the def cases.
+
+Similar considerations apply to KubeVirt.
+In this case, however, there is no configuration where the virtual topology is defined in a way that it matches the physical one (not even vtune).
+This therefore explains why, for KubeVirt, def is always the best performing configuration and vtune is, as a matter of fact, always the worst one.
+Which basically means that, for this benchmark, trying to tune a KubeVirt system, following the same principles that works well on KVM, may actually lead to worse performance.
+
+### NPB
+
+The figure shows the results of NPB, running within 2 tasks in parallel, inside a 4 vCPUs VM, for KVM and KubeVirt, under different host load scenarios.
+
+![NPB](images/naspb.png)
+
+The NPB benchmark behave similarly to STREAM.
+It being a compute intensive benchmark, however, makes it even more sensitive to where tasks actually run, especially on a system with multiple threads per cores, like our server.
+We, in fact, see that, both for KVM and KubeVirt, the pin\_def and pin configurations perform better, some of the times, and worse, some other times, as comapred to def.
+This indeed depends on the combined work of the host and guest scheduler and actual results cannot be easily and reliably predicted.
+Therefore, none of this configurations should be considered a good one.
+
+When vtune is used, in the KVM case this consistently lead to best performance, as it was expected.
+Note also how, while def and vtune are very similar on an idle host, the difference between them increases (in favor of vtune) when the load on the host is higher.
+
+On KubeVirt, it is again the opposite: vtune consistently leads to worse performance than doing no tuning at all.
+So, even for NPB, tuning a KubeVirt system via resource partitioning is currently impossible.
+
+### cyclictest
+
+The figure shows the results of cyclictest, running with 4 tasks, inside a 4 vCPUs VM, for KVM and KubeVirt, under different host load scenarios.
+Each of the task is pinned to one of the VM vCPUs.
+This means that the guest scheduler, and hence the virtual topology of the VM, cannot have any impact on the results.
+What we can, therefore, expect is that running cyclictest inside a VM will be sensitive to vCPU pinning, but not so much to virtual topology.
+We show, for each configuration, both the average and the maximum latency achieved, among of all these 4 tasks.
+
+![cyclic](images/cyclic.png)
+
+The KVM results meet the previously stated expectations.
+In fact, all the tuned configurations (pin_def, pin and vtune) are, with only one exception (the maximum for the pin case, on an otherwise idle host), better than def.
+In particular, vtune (still on KVM), is again the overall best performing option.
+
+The beneficial effect of pinning, and its prevalence against any impact that virtual topology might have on the results, applies to the KubeVirt highly loaded scenario too.
+However, it is still unclear to us why, on KubeVirt:
+- in the idle and lightly loaded host scenarios, pinning does not help (actually, it often makes things worse);
+- the KubeVirt results are, overall, significantly worse than the KVM ones.
+
+Further investigation is ongoing in order to better understand these two aspects.
+
+### Kernbench
+
+The figure shows the result of running kernbench inside a 4 vCPUs VM while the host was: (a) idle, (b) lightly loaded and (c) highly loaded.
+Data point 1 in the plots corresponds to single job kernel builds (`-j1`); data point 2 to kernel builds with 2 jobs (`-j2`); data point 4 to build with 4 jobs (`-j4`). 
+
+![kernbench](images/kernbench.png)
+
+Kernbench is probably the most effective benchmark when it comes to showing how tuning is the most effective under specific load conditions.
+In fact, in the idle and lightly loaded host scenarios, pinning the vCPUs can lead to slowdowns, not only in the KubeVirt case (that are affected by the topology mismatch problem) but in the KVM one as well.
+
+In those cases, all the tuned configuration, with the only exception of vtune on KVM, performs worse than def.
+This is because in the def case the host scheduler is always able to make each of the VM's vCPUs that are busy run on one physical core.
+The vCPUs are therefore executing on one of the threads of such core, while the other thread is idle, and this guarantees good performance.
+On the other hand, if we pin the vCPUs on 2 cores (which is what happens in the pin_def, pin and vtune cases), when all the 4 vCPUs of the VM are busy (e.g., when we run with `-j4`) they need to use both the threads of the cores.
+And this is the case even if, since there is either no or only light extraneous host load, there are other cores of the host that are fully idle.
+This explains why in the `-j4` case all the configurations, including vtune on KVM, are worse than default.
+
+It is interesting to note how the vtune configuration, on KVM, manages to always beat def, the most interesting example of this being the loaded host scenario.
+This happens despite the fact that pinning makes it impossible for the host scheduler to distribute efficiently the vCPUs on the cores, and the 4 vCPUs of the VM all run on 2 cores, potentially saturating their thread count.
+It is, however, the guest kernel scheduler that is now able to schedule the active tasks on separate cores, e.g., in the `-j2` case, thanks to the fact that we have defined a matching virtual and physical topology.
+Of course, this can't work for `-j4`, as in that case there is enough work to do inside the VM for saturating the 2 cores its vCPUs are forced to run on.
+This is, in fact, why def keeps being better even than vtune, for `-j4`, in both the idle and lightly loaded host scenarios. 
+And this is also confirmed by the fact that, in the highly loaded scenario instead, where we saturate the CPU bandwidth even at the host level, the performance of def and vtune are much more similar.
+
+Overall, vtune can be considered the best solution, for KVM.
+
+For Kubevirt, we observe here as well the phenomenon that, due to the topology mismatch, vtune is the worst performing configuration. For instance, in the `-j2` run, loaded host scenario, vtune reaches both terrible and very inconsistent performance.
+
+
 ## References
 
 [1]: https://github.com/kubevirt/kubevirt
@@ -246,3 +504,7 @@ This paper includes a subset of all the results that we collected.
 [16]: http://ck.kolivas.org/apps/kernbench/kernbench-0.50/
 [17]: https://www.iozone.org/
 [18]: sttress-ng
+[19]: https://www.youtube.com/watch?v=8yA2SNnx2Ko
+[20]: https://youtu.be/3tUTxGpwMUc
+[21]: https://kubevirt.io/user-guide/virtual_machines/dedicated_cpu_resources/
+[22]: https://github.com/kubevirt/kubevirt/pull/6251
